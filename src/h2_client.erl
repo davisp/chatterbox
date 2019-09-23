@@ -1,5 +1,5 @@
 -module(h2_client).
--include("http2.hrl").
+-include("h2.hrl").
 
 %% Today's the day! We need to turn this gen_server into a gen_statem
 %% which means this is going to look a lot like the "opposite of
@@ -15,11 +15,8 @@
 
 %% API
 -export([
-         start_link/0,
          start_link/2,
-         start_link/3,
          start_link/4,
-         start_ssl_upgrade_link/4,
          stop/1,
          send_request/3,
          send_ping/1,
@@ -28,65 +25,19 @@
         ]).
 
 
-%% this is gonna get weird. start_link/* is going to call
-%% http2_socket's start_link function, which will handle opening the
-%% socket and sending the HTTP/2 Preface over the wire. Once that's
-%% working, it's going to call gen_statem:start_link(http2c, [SocketPid],
-%% []) which will then use our init/1 callback. You can't actually
-%% start this gen_statem with this API. That's intentional, it will
-%% eventually get started if things go right. If they don't, you
-%% wouldn't want one of these anyway.
-
-%% No arg version uses a bunch of defaults, which will have to be
-%% reviewed if/when this module is refactored into it's own library.
--spec start_link() -> {ok, pid()} | ignore | {error, any()}.
-start_link() ->
-    %% Defaults for local server, not sure these defaults are
-    %% "sensible" if this module is removed from this repo
-
-    {ok, Port} = application:get_env(chatterbox, port),
-    {ok, SSLEnabled} = application:get_env(chatterbox, ssl),
-    case SSLEnabled of
-        true ->
-            start_link(https, "localhost", Port);
-        false ->
-            start_link(http, "localhost", Port)
+-spec start_link(string(), [ssl:ssl_option()]) ->
+                        {ok, pid()}
+                      | ignore
+                      | {error, term()}.
+start_link(URI, SSLOptions) ->
+    case http_uri:parse(URI) of
+        {ok, {Scheme, _, Host, Port, _, _} ->
+            start_link(Scheme, Host, Port, SSLOptions);
+        {ok, {Scheme, _, Host, Port, _, _, _}} ->
+            start_link(Scheme, Host, Port, SSLOptions);
+        _ ->
+            {error, {invalid_uri, URI}}
     end.
-
-%% Start up with scheme and hostname only, default to standard ports
-%% and options
--spec start_link(http | https,
-                 string()) ->
-                        {ok, pid()}
-                      | ignore
-                      | {error, term()}.
-start_link(http, Host) ->
-    start_link(http, Host, 80);
-start_link(https,Host) ->
-    start_link(https, Host, 443).
-
-%% Start up with a specific port, or specific SSL options, but not
-%% both.
--spec start_link(http | https,
-                 string(),
-                 non_neg_integer() | [ssl:ssl_option()]) ->
-                        {ok, pid()}
-                      | ignore
-                      | {error, term()}.
-start_link(http, Host, Port)
-  when is_integer(Port) ->
-    start_link(http, Host, Port, []);
-start_link(https, Host, Port)
-  when is_integer(Port) ->
-    {ok, SSLOptions} = application:get_env(chatterbox, ssl_options),
-    DefaultSSLOptions = [
-                         {client_preferred_next_protocols, {client, [<<"h2">>]}}|
-                         SSLOptions
-                        ],
-    start_link(https, Host, Port, DefaultSSLOptions);
-start_link(https, Host, SSLOptions)
-  when is_list(SSLOptions) ->
-    start_link(https, Host, 443, SSLOptions).
 
 
 %% Here's your all access client starter. MAXIMUM TUNABLES! Scheme,
@@ -101,15 +52,15 @@ start_link(https, Host, SSLOptions)
                         {ok, pid()}
                       | ignore
                       | {error, term()}.
-start_link(Transport, Host, Port, SSLOptions) ->
-    NewT = case Transport of
-               http -> gen_tcp;
-               https -> ssl
-           end,
-    h2_connection:start_client_link(NewT, Host, Port, SSLOptions, chatterbox:settings(client)).
+start_link(http, Host, Port, SSLOptions) ->
+    Settings = h2_settings:new(),
+    h2_connection:start_client_link(gen_tcp, Host, Port, SSLOptions, Settings);
+start_link(https, Host, Port, SSLOptions) ->
+    Settings = h2_settings:new(),
+    h2_connection:start_client_link(ssl, Host, Port, SSLOptions, Settings);
+start_link(Transport, _, _, _) ->
+    {error, {invalid_transport, Transport}}.
 
-start_ssl_upgrade_link(Host, Port, InitialMessage, SSLOptions) ->
-    h2_connection:start_ssl_upgrade_link(Host, Port, InitialMessage, SSLOptions, chatterbox:settings(client)).
 
 -spec stop(pid()) -> ok.
 stop(Pid) ->
