@@ -4,12 +4,7 @@
 
 %% Start/Stop API
 -export([
-         start_client_link/2,
          start_client_link/5,
-         start_ssl_upgrade_link/5,
-         start_server_link/3,
-         become/1,
-         become/2,
          become/3,
          stop/1
         ]).
@@ -48,7 +43,6 @@
 
 %% gen_statem states
 -export([
-         listen/3,
          handshake/3,
          connected/3,
          continuation/3,
@@ -58,15 +52,6 @@
 -export([
          go_away/2
         ]).
-
--record(h2_listening_state, {
-          ssl_options   :: [ssl:ssl_option()],
-          listen_socket :: ssl:sslsocket() | inet:socket(),
-          transport     :: gen_tcp | ssl,
-          listen_ref    :: non_neg_integer(),
-          acceptor_callback = fun chatterbox_sup:start_socket/0 :: fun(),
-          server_settings = #settings{} :: settings()
-         }).
 
 -record(continuation_state, {
           stream_id                 :: stream_id(),
@@ -79,8 +64,6 @@
 
 -record(connection, {
           type = undefined :: client | server | undefined,
-          ssl_options = [],
-          listen_ref :: non_neg_integer() | undefined,
           socket = undefined :: sock:socket(),
           peer_settings = #settings{} :: settings(),
           self_settings = #settings{} :: settings(),
@@ -91,8 +74,8 @@
           settings_sent = queue:new() :: queue:queue(),
           next_available_stream_id = 2 :: stream_id(),
           streams :: h2_stream_set:stream_set(),
-          stream_callback_mod = application:get_env(chatterbox, stream_callback_mod, chatterbox_static_stream) :: module(),
-          stream_callback_opts = application:get_env(chatterbox, stream_callback_opts, []) :: list(),
+          stream_callback_mod :: undefined | module(),
+          stream_callback_opts = [] :: list(),
           buffer = empty :: empty | {binary, binary()} | {frame, h2_frame:header(), binary()},
           continuation = undefined :: undefined | #continuation_state{},
           flow_control = auto :: auto | manual,
@@ -106,11 +89,6 @@
 
 -export_type([send_option/0, send_opts/0]).
 
--ifdef(OTP_RELEASE).
--define(ssl_accept(ClientSocket, SSLOptions), ssl:handshake(ClientSocket, SSLOptions)).
--else.
--define(ssl_accept(ClientSocket, SSLOptions), ssl:ssl_accept(ClientSocket, SSLOptions)).
--endif.
 
 -spec start_client_link(gen_tcp | ssl,
                         inet:ip_address() | inet:hostname(),
@@ -122,57 +100,22 @@
 start_client_link(Transport, Host, Port, SSLOptions, Http2Settings) ->
     gen_statem:start_link(?MODULE, {client, Transport, Host, Port, SSLOptions, Http2Settings}, []).
 
--spec start_client_link(socket(),
-                        settings()
-                       ) ->
-                               {ok, pid()} | ignore | {error, term()}.
-start_client_link({Transport, Socket}, Http2Settings) ->
-    gen_statem:start_link(?MODULE, {client, {Transport, Socket}, Http2Settings}, []).
-
--spec start_ssl_upgrade_link(inet:ip_address() | inet:hostname(),
-                             inet:port_number(),
-                             binary(),
-                             [ssl:ssl_option()],
-                             settings()
-                            ) ->
-                                    {ok, pid()} | ignore | {error, term()}.
-start_ssl_upgrade_link(Host, Port, InitialMessage, SSLOptions, Http2Settings) ->
-    gen_statem:start_link(?MODULE, {client_ssl_upgrade, Host, Port, InitialMessage, SSLOptions, Http2Settings}, []).
-
--spec start_server_link(socket(),
-                        [ssl:ssl_option()],
-                        #settings{}) ->
-                               {ok, pid()} | ignore | {error, term()}.
-start_server_link({Transport, ListenSocket}, SSLOptions, Http2Settings) ->
-    gen_statem:start_link(?MODULE, {server, {Transport, ListenSocket}, SSLOptions, Http2Settings}, []).
-
--spec become(socket()) -> no_return().
-become(Socket) ->
-    become(Socket, h2_settings:new()).
-
--spec become(socket(), settings()) -> no_return().
-become(Socket, Http2Settings) ->
-    become(Socket, Http2Settings, #{}).
 
 -spec become(socket(), settings(), maps:map()) -> no_return().
 become({Transport, Socket}, Http2Settings, ConnectionSettings) ->
     ok = sock:setopts({Transport, Socket}, [{packet, raw}, binary]),
-    case start_http2_server(Http2Settings,
-                           #connection{
-                              stream_callback_mod =
-                                  maps:get(stream_callback_mod, ConnectionSettings,
-                                           application:get_env(chatterbox, stream_callback_mod, chatterbox_static_stream)),
-                              stream_callback_opts =
-                                  maps:get(stream_callback_opts, ConnectionSettings,
-                                           application:get_env(chatterbox, stream_callback_opts, [])),
-                              streams = h2_stream_set:new(server),
-                              socket = {Transport, Socket}
-                             }) of
+    CBMod = maps:get(stream_callback_mod, ConnectionSettings, undefined),
+    CBOpts = maps:get(stream_callback_opts, ConnectionSettings, undefined),
+
+    Conn = #connection{
+        stream_callback_mod = CBMod,
+        stream_callback_opts = CBOpts,
+        streams = h2_stream_set:new(server),
+        socket = {Transport, Socket}
+    }
+    case init_server(Http2Settings, Opts) of
         {_, handshake, NewState} ->
-            gen_statem:enter_loop(?MODULE,
-                                  [],
-                                  handshake,
-                                  NewState);
+            gen_statem:enter_loop(?MODULE, [], handshake, NewState);
         {_, closing, _NewState} ->
             sock:close({Transport, Socket}),
             exit(invalid_preface)
@@ -189,37 +132,14 @@ init({client, Transport, Host, Port, SSLOptions, Http2Settings}) ->
 init({client, {Transport, Socket}, Http2Settings}) ->
     ok = sock:setopts({Transport, Socket}, [{packet, raw}, binary, {active, once}]),
     Transport:send(Socket, <<?PREFACE>>),
-    InitialState =
-        #connection{
-           type = client,
-           streams = h2_stream_set:new(client),
-           socket = {Transport, Socket},
-           next_available_stream_id=1,
-           flow_control=application:get_env(chatterbox, client_flow_control, auto)
-          },
-    {ok,
-     handshake,
-     send_settings(Http2Settings, InitialState),
-     4500};
-init({server, {Transport, ListenSocket}, SSLOptions, Http2Settings}) ->
-    %% prim_inet:async_accept is dope. It says just hang out here and
-    %% wait for a message that a client has connected. That message
-    %% looks like:
-    %% {inet_async, ListenSocket, Ref, {ok, ClientSocket}}
-    case prim_inet:async_accept(ListenSocket, -1) of
-        {ok, Ref} ->
-            {ok,
-             listen,
-             #h2_listening_state{
-                ssl_options = SSLOptions,
-                listen_socket = ListenSocket,
-                listen_ref = Ref,
-                transport = Transport,
-                server_settings = Http2Settings
-               }}; %% No timeout here, it's just a listener
-        {error, Reason} ->
-            {stop, Reason}
-    end.
+    InitialState = #connection{
+        type = client,
+        streams = h2_stream_set:new(client),
+        socket = {Transport, Socket},
+        next_available_stream_id = 1,
+        flow_control = auto
+    },
+    {ok, handshake, send_settings(Http2Settings, InitialState), 4500}.
 
 callback_mode() ->
     state_functions.
@@ -319,42 +239,6 @@ update_settings(Pid, Payload) ->
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     gen_statem:cast(Pid, stop).
-
-%% The listen state only exists to wait around for new prim_inet
-%% connections
-listen(info, {inet_async, ListenSocket, Ref, {ok, ClientSocket}},
-            #h2_listening_state{
-               listen_socket = ListenSocket,
-               listen_ref = Ref,
-               transport = Transport,
-               ssl_options = SSLOptions,
-               acceptor_callback = AcceptorCallback,
-               server_settings = Http2Settings
-              }) ->
-
-    %If anything crashes in here, at least there's another acceptor ready
-    AcceptorCallback(),
-
-    inet_db:register_socket(ClientSocket, inet_tcp),
-
-    Socket = case Transport of
-        gen_tcp ->
-            ClientSocket;
-        ssl ->
-            {ok, AcceptSocket} = ?ssl_accept(ClientSocket, SSLOptions),
-            {ok, <<"h2">>} = ssl:negotiated_protocol(AcceptSocket),
-            AcceptSocket
-    end,
-    start_http2_server(
-      Http2Settings,
-      #connection{
-         streams = h2_stream_set:new(server),
-         socket={Transport, Socket}
-        });
-listen(timeout, _, State) ->
-    go_away(?PROTOCOL_ERROR, State);
-listen(Type, Msg, State) ->
-    handle_event(Type, Msg, State).
 
 -spec handshake(gen_statem:event_type(), {frame, h2_frame:frame()} | term(), connection()) ->
                     {next_state,
@@ -1355,24 +1239,19 @@ client_options(Transport, SSLOptions) ->
             ClientSocketOptions
     end.
 
-start_http2_server(
-  Http2Settings,
-  #connection{
-     socket=Socket
-    }=Conn) ->
+init_server(Http2Settings, Conn) ->
+    #connection{
+        socket = Socket
+    } = Conn,
     case accept_preface(Socket) of
         ok ->
             ok = active_once(Socket),
-            NewState =
-                Conn#connection{
-                  type=server,
-                  next_available_stream_id=2,
-                  flow_control=application:get_env(chatterbox, server_flow_control, auto)
-                 },
-            {next_state,
-             handshake,
-             send_settings(Http2Settings, NewState)
-            };
+            NewState = Conn#connection{
+                type = server,
+                next_available_stream_id = 2,
+                flow_control = auto
+            },
+            {next_state, handshake, send_settings(Http2Settings, NewState)};
         {error, invalid_preface} ->
             {next_state, closing, Conn}
     end.
