@@ -148,7 +148,7 @@ start_server_link({Transport, ListenSocket}, SSLOptions, Http2Settings) ->
 
 -spec become(socket()) -> no_return().
 become(Socket) ->
-    become(Socket, chatterbox:settings(server)).
+    become(Socket, h2_settings:new()).
 
 -spec become(socket(), settings()) -> no_return().
 become(Socket, Http2Settings) ->
@@ -201,19 +201,6 @@ init({client, {Transport, Socket}, Http2Settings}) ->
      handshake,
      send_settings(Http2Settings, InitialState),
      4500};
-init({client_ssl_upgrade, Host, Port, InitialMessage, SSLOptions, Http2Settings}) ->
-    case gen_tcp:connect(Host, Port, [{active, false}]) of
-        {ok, TCP} ->
-            gen_tcp:send(TCP, InitialMessage),
-            case ssl:connect(TCP, client_options(ssl, SSLOptions)) of
-                {ok, Socket} ->
-                    init({client, {ssl, Socket}, Http2Settings});
-                {error, Reason} ->
-                    {stop, Reason}
-            end;
-        {error, Reason} ->
-            {stop, Reason}
-    end;
 init({server, {Transport, ListenSocket}, SSLOptions, Http2Settings}) ->
     %% prim_inet:async_accept is dope. It says just hang out here and
     %% wait for a message that a client has connected. That message
