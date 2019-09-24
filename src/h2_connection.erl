@@ -684,11 +684,8 @@ route_frame(Frame, Conn) ->
     error_logger:error_msg(Msg, [h2_frame:format(Frame)]),
     go_away(?PROTOCOL_ERROR, Conn).
 
-handle_event(_, {stream_finished,
-              StreamId,
-              Headers,
-              Body},
-             Conn) ->
+
+handle_event(_, {stream_finished, StreamId, Headers, Body}, Conn) ->
     Stream = h2_stream_set:get(StreamId, Conn#connection.streams),
     case h2_stream_set:type(Stream) of
         active ->
@@ -698,16 +695,15 @@ handle_event(_, {stream_finished,
                     server -> garbage;
                     client -> {Headers, Body}
                 end,
-            {_NewStream, NewStreams} =
-                h2_stream_set:close(
-                  Stream,
-                  Response,
-                  Conn#connection.streams),
+            {_NewStream, NewStreams} = h2_stream_set:close(
+                    Stream,
+                    Response,
+                    Conn#connection.streams
+                ),
 
-            NewConn =
-                Conn#connection{
-                  streams = NewStreams
-                 },
+            NewConn = Conn#connection{
+                streams = NewStreams
+            },
             case {Conn#connection.type, is_pid(NotifyPid)} of
                 {client, true} ->
                     NotifyPid ! {'END_STREAM', StreamId};
@@ -719,47 +715,39 @@ handle_event(_, {stream_finished,
             %% stream finished multiple times
             {keep_state, Conn}
     end;
-handle_event(_, {send_window_update, 0}, Conn) ->
-    {keep_state, Conn};
-handle_event(_, {send_window_update, Size},
-             #connection{
-                recv_window_size=CRWS,
-                socket=Socket
-                }=Conn) ->
-    ok = h2_frame_window_update:send(Socket, Size, 0),
-    {keep_state,
-     Conn#connection{
-       recv_window_size=CRWS+Size
-      }};
-handle_event(_, {update_settings, Http2Settings},
-             #connection{}=Conn) ->
-    {keep_state,
-     send_settings(Http2Settings, Conn)};
-handle_event(_, {send_headers, StreamId, Headers, Opts},
-             #connection{
-                encode_context=EncodeContext,
-                streams = Streams,
-                socket = Socket
-               }=Conn
-            ) ->
-   StreamComplete = proplists:get_value(send_end_stream, Opts, false),
 
+handle_event(_, {update_settings, Http2Settings}, Conn) ->
+    {keep_state, send_settings(Http2Settings, Conn)};
+
+handle_event(_, {send_headers, StreamId, Headers, Opts}, Conn) ->
+    #connection{
+        encode_context=EncodeCtx,
+        streams = Streams,
+        socket = Socket,
+        peer_settings = #settings{
+            max_frame_size = MaxFrameSize
+        }
+    } = Conn,
+
+    StreamComplete = proplists:get_value(send_end_stream, Opts, false),
     Stream = h2_stream_set:get(StreamId, Streams),
+
     case h2_stream_set:type(Stream) of
         active ->
-            {FramesToSend, NewContext} =
-                h2_frame_headers:to_frames(h2_stream_set:stream_id(Stream),
-                                           Headers,
-                                           EncodeContext,
-                                            (Conn#connection.peer_settings)#settings.max_frame_size,
-                                           StreamComplete
-                                          ),
-            [sock:send(Socket, h2_frame:to_binary(Frame)) || Frame <- FramesToSend],
-            send_h(Stream, Headers),
-            {keep_state,
-             Conn#connection{
-               encode_context=NewContext
-              }};
+            {Frames, NewCtx} = h2_headers:to_frames(
+                    StreamId,
+                    Headers,
+                    EncodeCtx,
+                    MaxFrameSize,
+                    StreamComplete
+                ),
+
+            send_frames(Conn, Frames),
+
+            NewConn = Conn#connection{
+                encode_context = NewContext
+            },
+            {keep_state, NewConn};
         idle ->
             %% In theory this is a client maybe activating a stream,
             %% but in practice, we've already activated the stream in
@@ -768,24 +756,28 @@ handle_event(_, {send_headers, StreamId, Headers, Opts},
         closed ->
             {keep_state, Conn}
     end;
-handle_event(_, {send_trailers, StreamId, Headers, _Opts},
-             #connection{
-                encode_context=EncodeContext,
-                streams = Streams,
-                socket = _Socket
-               }=Conn
-            ) ->
+
+handle_event(_, {send_trailers, StreamId, Headers, _Opts}, Conn) ->
+    #connection{
+        encode_context = EncodeCtx,
+        streams = Streams,
+        peer_settings = #settings{
+            max_frame_size = MaxFrameSize
+        }
+    } = Conn,
     Stream = h2_stream_set:get(StreamId, Streams),
     case h2_stream_set:type(Stream) of
         active ->
             {FramesToSend, NewContext} =
-                h2_frame_headers:to_frames(h2_stream_set:stream_id(Stream),
-                                           Headers,
-                                           EncodeContext,
-                                           (Conn#connection.peer_settings)#settings.max_frame_size,
-                                           true
-                                          ),
-            NewS = h2_stream_set:update_trailers(FramesToSend, Stream),
+                h2_headers:to_frames(
+                        StreamId,
+                        Headers,
+                        EncodeCtx,
+                        MaxFrameSize,
+                        true
+                    ),
+            NewStream = h2_stream_set:update_trailers(FramesToSend, Stream),
+
             {NewSWS, NewStreams} =
                 h2_stream_set:send_what_we_can(
                   StreamId,
