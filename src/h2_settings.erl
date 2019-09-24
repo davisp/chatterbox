@@ -3,6 +3,8 @@
 
 -export([
          new/0,
+         validate/1,
+         merge/2,
          diff/2,
          to_proplist/1
         ]).
@@ -11,6 +13,36 @@
 -spec new() -> settings().
 new() ->
     #settings{}.
+
+
+-spec validate([proplists:property()]) -> ok | {error, integer()}.
+validate([]) ->
+    ok;
+validate([{?ENABLE_PUSH, Push} | _]) when Push > 1; Push < 0 ->
+    {error, ?PROTOCOL_ERROR};
+validate([{?INITIAL_WINDOW_SIZE, Size} | _]) when Size >=2147483648 ->
+    {error, ?FLOW_CONTROL_ERROR};
+validate([{?MAX_FRAME_SIZE, Size} | _]) when Size < 16384; Size > 16777215 ->
+    {error, ?PROTOCOL_ERROR};
+validate([_ | Rest]) ->
+    validate(Rest).
+
+
+-spec merge(settings(), [{non_neg_integer(), non_neg_integer()}]) -> settings().
+merge(Settings, []) ->
+    Settings;
+merge(Settings, [{?HEADER_TABLE_SIZE, Value} | Rest]) ->
+    merge(Settings#settings{header_table_size = Value}, Rest);
+merge(Settings, [{?ENABLE_PUSH, Value} | Rest]) ->
+    merge(Settings#settings{enable_push = Value}, Rest);
+merge(Settings, [{?MAX_CONCURRENT_STREAMS, Value} | Rest]) ->
+    merge(Settings#settings{max_concurrent_streams = Value}, Rest);
+merge(Settings, [{?INITIAL_WINDOW_SIZE, Value} | Rest]) ->
+    merge(Settings#settings{initial_window_size = Value}, Rest);
+merge(Settings, [{?MAX_FRAME_SIZE, Value} | Rest]) ->
+    merge(Settings#settings{max_frame_size = Value}, Rest);
+merge(Settings, [{?MAX_HEADER_LIST_SIZE, Value} | Rest]) ->
+    merge(Settings#settings{max_header_list_size = Value}, Rest).
 
 
 -spec diff(settings(), settings()) -> settings_proplist().
