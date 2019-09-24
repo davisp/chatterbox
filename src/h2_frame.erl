@@ -4,7 +4,16 @@
 
 -export([
     recv/1,
-    render/1
+    render/1,
+
+    new/1,
+    new/2,
+    new/3,
+
+    settings_ack/0,
+    window_update/2,
+
+    set_flag/2
 ]).
 
 
@@ -45,6 +54,47 @@ render(Frames) when is_list(Frames) ->
         render_frame(Frame)
     end, Frames),
     sock:send(Socket, IoData).
+
+
+new(Type) ->
+    new(Type, 0, 0).
+
+
+new(Type, StreamId) ->
+    new(Type, StreamId, 0).
+
+
+new(Type, StreamId, Flags) ->
+    #frame{
+        type = Type,
+        flags = Flags,
+        stream_id = StreamId
+    }.
+
+
+settings_ack() ->
+    #frame{
+        type = ?SETTINGS,
+        flags = ?ACK,
+        stream_id = 0,
+        data = []
+    }.
+
+
+window_update(StreamId, Length) ->
+    #frame{
+        type = ?WINDOW_UPDATE,
+        flags = 0,
+        stream_id = StreamId,
+        data = Length
+    }.
+
+
+set_flags(Frame, Flags) ->
+    #frame{
+        flags = OldFlags
+    } = Frame,
+    Frame#frame{flags = OldFlags bor Flags}.
 
 
 recv_frame_header(Bin) ->
