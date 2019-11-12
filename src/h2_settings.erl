@@ -45,6 +45,11 @@ merge(Settings, [{?MAX_HEADER_LIST_SIZE, Value} | Rest]) ->
     merge(Settings#settings{max_header_list_size = Value}, Rest).
 
 
+frame(OldSettings, NewSettings) ->
+    ok.
+
+
+
 -spec diff(settings(), settings()) -> settings_proplist().
 diff(OldSettings, NewSettings) ->
     OldPl = to_proplist(OldSettings),

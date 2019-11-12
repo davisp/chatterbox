@@ -1,7 +1,9 @@
 -module(h2_headers).
 
 -export([
-    to_frames/1
+    to_frames/1,
+
+    handle_resp_headers/1
 ]).
 
 
@@ -21,6 +23,18 @@ to_frames(StreamId, Headers, EncodeContext, MaxFrameSize, EndStream) ->
     Chunks = split(HeadersBin, MaxFrameSize),
     Frames = build_frames(StreamId, Chunks, EndStream),
     {Frames, NewContext}.
+
+
+handle_resp_headers(RawHeaders) ->
+    validate_resp_headers(RawHeaders).
+    {Value, Headers} = case RawHeaders of
+        [{<<":status">>, V} | Rest] -> {V, Rest};
+        [{<<":status">>, V, _} | Rest] -> {V, Rest}
+    end,
+    #{
+        status => binary_to_integer(Value),
+        headers => Headers
+    }.
 
 
 -spec split(binary(), pos_integer()) -> [binary()].
@@ -55,3 +69,42 @@ build_frames(StreamId, [FirstChunk | RestChunks], EndStream) ->
     NewLastFrame = h2_frame:set_flag(LastFrame, ?END_HEADERS),
 
     lists:reverse(RestRevFrames, [NewLastFrame]).
+
+
+validate_resp_headers([{Name, Value} | Rest]) ->
+    validate_resp_headers([{Name, Value, []} | Rest]);
+
+validate_resp_headers([{<<":status">>, Value, _} | Rest]) ->
+    try
+        binary_to_integer(Value)
+    catch _:_ ->
+        ?STREAM_ERROR(?PROTOCOL_ERROR)
+    end,
+    validate_headers(Rest);
+
+validate_resp_headers(_) ->
+    ?STREAM_ERROR(?PROTOCOL_ERROR).
+
+
+validate_headers([{Name, Vaule} | Rest]) ->
+    valdiate_headers([{Name, Value, []} | Rest]);
+
+validate_headers([{Name, _Value} | _]) ->
+    case Name of
+        <<":", _/binary>> ->
+            ?STREAM_ERROR(?PROTOCOL_ERROR);
+        <<"connection">> ->
+            ?STREAM_ERROR(?PROTOCOL_ERROR);
+        <<"te">> when Value == <<"trailers">> ->
+            ok;
+        <<"te">> ->
+            ?STREAM_ERROR(?PROTOCOL_ERROR)
+        Else ->
+            NameList = binary_to_list(Name),
+            case NameList == string:to_lower(NameList) of
+                true ->
+                    ok;
+                false ->
+                    ?STREAM_ERROR(?PROTOCOL_ERROR)
+            end
+    end.

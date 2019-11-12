@@ -1,753 +1,479 @@
 -module(h2_stream).
--include("http2.hrl").
 
-%% Public API
+
+% User API
 -export([
-         start_link/5,
-         send_event/2,
-         send_pp/2,
-         send_data/2,
-         stream_id/0,
-         call/2,
-         connection/0,
-         send_window_update/1,
-         send_connection_window_update/1,
-         rst_stream/2,
-         stop/1
-        ]).
+    send/2,
+    send/3,
 
-%% gen_statem callbacks
--behaviour(gen_statem).
+    recv/1
+]).
 
--export([init/1,
-         callback_mode/0,
-         terminate/3,
-         code_change/4]).
 
-%% gen_statem states
+% Internal API
 -export([
-         idle/3,
-         reserved_local/3,
-         reserved_remote/3,
-         open/3,
-         half_closed_local/3,
-         half_closed_remote/3,
-         closed/3
-        ]).
+    new/2,
+    new/6,
 
--type stream_state_name() :: 'idle'
-                           | 'open'
-                           | 'closed'
-                           | 'reserved_local'
-                           | 'reserved_remote'
-                           | 'half_closed_local'
-                           | 'half_closed_remote'.
+    reset/2,
 
--record(stream_state, {
-          stream_id = undefined :: stream_id(),
-          connection = undefined :: undefined | pid(),
-          socket = undefined :: sock:socket(),
-          state = idle :: stream_state_name(),
-          incoming_frames = queue:new() :: queue:queue(h2_frame:frame()),
-          request_headers = [] :: hpack:headers(),
-          request_body :: iodata() | undefined,
-          request_body_size = 0 :: non_neg_integer(),
-          request_end_stream = false :: boolean(),
-          request_end_headers = false :: boolean(),
-          response_headers = [] :: hpack:headers(),
-          response_trailers = [] :: hpack:headers(),
-          response_body :: iodata() | undefined,
-          response_end_headers = false :: boolean(),
-          response_end_stream = false :: boolean(),
-          next_state = undefined :: undefined | stream_state_name(),
-          promised_stream = undefined :: undefined | state(),
-          callback_state = undefined :: any(),
-          callback_mod = undefined :: module()
-         }).
+    handle_event/3,
 
--type state() :: #stream_state{}.
--type callback_state() :: any().
--export_type([state/0, callback_state/0]).
-
--callback init(
-            Conn :: pid(),
-            StreamId :: stream_id(),
-            CallbackOptions :: list()
-           ) ->
-  {ok, callback_state()}.
-
--callback on_receive_request_headers(
-            Headers :: hpack:headers(),
-            CallbackState :: callback_state()) ->
-    {ok, NewState :: callback_state()}.
-
--callback on_send_push_promise(
-            Headers :: hpack:headers(),
-            CallbackState :: callback_state()) ->
-    {ok, NewState :: callback_state()}.
-
--callback on_receive_request_data(
-            iodata(),
-            CallbackState :: callback_state())->
-    {ok, NewState :: callback_state()}.
-
--callback on_request_end_stream(
-            CallbackState :: callback_state()) ->
-    {ok, NewState :: callback_state()}.
-
-%% Public API
--spec start_link(
-        StreamId :: stream_id(),
-        Connection :: pid(),
-        CallbackModule :: module(),
-        CallbackOptions :: list(),
-        Socket :: sock:socket()
-                  ) ->
-                        {ok, pid()} | ignore | {error, term()}.
-start_link(StreamId, Connection, CallbackModule, CallbackOptions, Socket) ->
-    gen_statem:start_link(?MODULE,
-                          [StreamId,
-                           Connection,
-                           CallbackModule,
-                           CallbackOptions,
-                           Socket],
-                          []).
-
-send_event(Pid, Event) ->
-    gen_statem:cast(Pid, Event).
-
--spec send_pp(pid(), hpack:headers()) ->
-                     ok.
-send_pp(Pid, Headers) ->
-    gen_statem:cast(Pid, {send_pp, Headers}).
-
--spec send_data(pid(), h2_frame_data:frame()) ->
-                        ok | flow_control.
-send_data(Pid, Frame) ->
-    gen_statem:cast(Pid, {send_data, Frame}).
-
--spec stream_id() -> stream_id().
-stream_id() ->
-    gen_statem:call(self(), stream_id).
-
-call(Pid, Msg) ->
-    gen_statem:call(Pid, Msg).
-
--spec connection() -> pid().
-connection() ->
-    gen_statem:call(self(), connection).
-
--spec send_window_update(non_neg_integer()) -> ok.
-send_window_update(Size) ->
-    gen_statem:cast(self(), {send_window_update, Size}).
-
--spec send_connection_window_update(non_neg_integer()) -> ok.
-send_connection_window_update(Size) ->
-    gen_statem:cast(self(), {send_connection_window_update, Size}).
-
-rst_stream(Pid, Code) ->
-    gen_statem:call(Pid, {rst_stream, Code}).
-
--spec stop(pid()) -> ok.
-stop(Pid) ->
-    gen_statem:stop(Pid).
-
-init([
-      StreamId,
-      ConnectionPid,
-      CB,
-      CBOptions,
-      Socket
-     ]) ->
-    %% TODO: Check for CB implementing this behaviour
-    {ok, CallbackState} = CB:init(ConnectionPid, StreamId, [Socket | CBOptions]),
-
-    {ok, idle, #stream_state{
-                  callback_mod=CB,
-                  socket=Socket,
-                  stream_id=StreamId,
-                  connection=ConnectionPid,
-                  callback_state=CallbackState
-                 }}.
-
-callback_mode() ->
-    state_functions.
-
-%% IMPORTANT: If we're in an idle state, we can only send/receive
-%% HEADERS frames. The diagram in the spec wants you believe that you
-%% can send or receive PUSH_PROMISES too, but that's a LIE. What you
-%% can do is send PPs from the open or half_closed_remote state, or
-%% receive them in the open or half_closed_local state. Then, that
-%% will create a new stream in the idle state and THAT stream can
-%% transition to one of the reserved states, but you'll never get a
-%% PUSH_PROMISE frame with that Stream Id. It's a subtle thing, but it
-%% drove me crazy until I figured it out
-
-%% Server 'RECV H'
-idle(cast, {recv_h, Headers},
-     #stream_state{
-        callback_mod=CB,
-        callback_state=CallbackState
-       }=Stream) ->
-    case is_valid_headers(request, Headers) of
-        ok ->
-            {ok, NewCBState} = CB:on_receive_request_headers(Headers, CallbackState),
-            {next_state,
-             open,
-             Stream#stream_state{
-               request_headers=Headers,
-               callback_state=NewCBState
-              }};
-        {error, Code} ->
-            rst_stream_(Code, Stream)
-    end;
-
-%% Server 'SEND PP'
-idle(cast, {send_pp, Headers},
-     #stream_state{
-        callback_mod=CB,
-        callback_state=CallbackState
-       }=Stream) ->
-    {ok, NewCBState} = CB:on_send_push_promise(Headers, CallbackState),
-    {next_state,
-     reserved_local,
-     Stream#stream_state{
-       request_headers=Headers,
-       callback_state=NewCBState
-       }, 0};
-       %% zero timeout lets us start dealing with reserved local,
-       %% because there is no END_STREAM event
-
-%% Client 'RECV PP'
-idle(cast, {recv_pp, Headers},
-     #stream_state{
-       }=Stream) ->
-    {next_state,
-     reserved_remote,
-     Stream#stream_state{
-       request_headers=Headers
-      }};
-%% Client 'SEND H'
-idle(cast, {send_h, Headers},
-     #stream_state{
-       }=Stream) ->
-    {next_state, open,
-     Stream#stream_state{
-        request_headers=Headers
-       }};
-idle(Type, Event, State) ->
-    handle_event(Type, Event, State).
-
-reserved_local(timeout, _,
-               #stream_state{
-                  callback_state=CallbackState,
-                  callback_mod=CB
-                  }=Stream) ->
-    check_content_length(Stream),
-    {ok, NewCBState} = CB:on_request_end_stream(CallbackState),
-    {next_state,
-     reserved_local,
-     Stream#stream_state{
-       callback_state=NewCBState
-      }};
-reserved_local(cast, {send_h, Headers},
-              #stream_state{
-                }=Stream) ->
-    {next_state,
-     half_closed_remote,
-     Stream#stream_state{
-       response_headers=Headers
-      }};
-reserved_local(cast, {send_t, Headers},
-              #stream_state{
-                }=Stream) ->
-    {next_state,
-     half_closed_remote,
-     Stream#stream_state{
-       response_trailers=Headers
-      }};
-reserved_local(Type, Event, State) ->
-    handle_event(Type, Event, State).
-
-reserved_remote(cast, {recv_h, Headers},
-                #stream_state{
-                  }=Stream) ->
-    {next_state,
-     half_closed_local,
-     Stream#stream_state{
-       response_headers=Headers
-      }};
-reserved_remote(cast, {recv_t, Headers},
-                #stream_state{
-                  }=Stream) ->
-    {next_state,
-     half_closed_local,
-     Stream#stream_state{
-       response_headers=Headers
-      }};
-reserved_remote(Type, Event, State) ->
-    handle_event(Type, Event, State).
-
-open(cast, recv_es,
-     #stream_state{
-        callback_mod=CB,
-        callback_state=CallbackState
-       }=Stream) ->
-    case check_content_length(Stream) of
-        ok ->
-            {ok, NewCBState} = CB:on_request_end_stream(CallbackState),
-            {next_state,
-             half_closed_remote,
-             Stream#stream_state{
-               callback_state=NewCBState
-              }};
-        rst_stream ->
-            {next_state,
-             closed,
-             Stream}
-    end;
-
-open(cast, {recv_data,
-      {#frame_header{
-          flags=Flags,
-          length=L,
-          type=?DATA
-         }, Payload}=F},
-     #stream_state{
-        incoming_frames=IFQ,
-        callback_mod=CB,
-        callback_state=CallbackState
-       }=Stream)
-  when ?NOT_FLAG(Flags, ?FLAG_END_STREAM) ->
-    Bin = h2_frame_data:data(Payload),
-    {ok, NewCBState} = CB:on_receive_request_data(Bin, CallbackState),
-    {next_state,
-     open,
-     Stream#stream_state{
-       %% TODO: We're storing everything in the state. It's fine for
-       %% some cases, but the decision should be left to the user
-       incoming_frames=queue:in(F, IFQ),
-       request_body_size=Stream#stream_state.request_body_size+L,
-       callback_state=NewCBState
-      }};
-open(cast, {recv_data,
-      {#frame_header{
-          flags=Flags,
-          length=L,
-          type=?DATA
-         }, Payload}=F},
-     #stream_state{
-        incoming_frames=IFQ,
-        callback_mod=CB,
-        callback_state=CallbackState
-       }=Stream)
-  when ?IS_FLAG(Flags, ?FLAG_END_STREAM) ->
-    Bin = h2_frame_data:data(Payload),
-    {ok, CallbackState1} = CB:on_receive_request_data(Bin, CallbackState),
-    NewStream = Stream#stream_state{
-                  incoming_frames=queue:in(F, IFQ),
-                  request_body_size=Stream#stream_state.request_body_size+L,
-                  request_end_stream=true,
-                  callback_state=CallbackState1
-                 },
-    case check_content_length(NewStream) of
-        ok ->
-            {ok, NewCBState} = CB:on_request_end_stream(CallbackState1),
-            {next_state,
-             half_closed_remote,
-             NewStream#stream_state{
-               callback_state=NewCBState
-              }};
-        rst_stream ->
-            {next_state,
-             closed,
-             NewStream}
-        end;
-
-%% Trailers
-open(cast, {recv_h, Trailers},
-     #stream_state{}=Stream) ->
-    case is_valid_headers(request, Trailers) of
-        ok ->
-            {next_state,
-             open,
-             Stream#stream_state{
-               request_headers=Stream#stream_state.request_headers ++ Trailers
-              }};
-        {error, Code} ->
-            rst_stream_(Code, Stream)
-    end;
-open(cast, {send_data,
-      {#frame_header{
-          type=?HEADERS,
-          flags=Flags
-         }, _}=F},
-     #stream_state{
-        socket=Socket
-       }=Stream) ->
-    sock:send(Socket, h2_frame:to_binary(F)),
-
-    NextState =
-        case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-            true ->
-                half_closed_local;
-            _ ->
-                open
-        end,
-    {next_state, NextState, Stream};
-open(cast, {send_data,
-      {#frame_header{
-          type=?DATA,
-          flags=Flags
-         }, _}=F},
-     #stream_state{
-        socket=Socket
-       }=Stream) ->
-    sock:send(Socket, h2_frame:to_binary(F)),
-
-    NextState =
-        case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-            true ->
-                half_closed_local;
-            _ ->
-                open
-        end,
-    {next_state, NextState, Stream};
-open(cast,
-  {send_h, Headers},
-  #stream_state{}=Stream) ->
-    {next_state,
-     open,
-     Stream#stream_state{
-       response_headers=Headers
-      }};
-open(cast,
-  {send_t, Headers},
-  #stream_state{}=Stream) ->
-    {next_state,
-     half_closed_local,
-     Stream#stream_state{
-       response_trailers=Headers
-      }};
-open(Type, Event, State) ->
-    handle_event(Type, Event, State).
+    queue/3,
+    dequeue/3
+]).
 
 
-half_closed_remote(cast,
-  {send_h, Headers},
-  #stream_state{}=Stream) ->
-    {next_state,
-     half_closed_remote,
-     Stream#stream_state{
-       response_headers=Headers
-      }};
-half_closed_remote(cast,
-  {send_t, Headers},
-  #stream_state{}=Stream) ->
-    {next_state,
-     half_closed_remote,
-     Stream#stream_state{
-       response_trailers=Headers
-      }};
-half_closed_remote(cast,
-                  {send_data,
-                   {
-                     #frame_header{
-                        flags=Flags,
-                        type=?DATA
-                       },_
-                   }=F}=_Msg,
-  #stream_state{
-     socket=Socket
-    }=Stream) ->
-    case sock:send(Socket, h2_frame:to_binary(F)) of
-        ok ->
-            case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-                true ->
-                    {next_state, closed, Stream, 0};
-                _ ->
-                    {next_state, half_closed_remote, Stream}
-            end;
-        {error,_} ->
-            {next_state, closed, Stream, 0}
-    end;
-half_closed_remote(cast,
-                  {send_data,
-                   {
-                     #frame_header{
-                        flags=Flags,
-                        type=?HEADERS
-                       },_
-                   }=F}=_Msg,
-  #stream_state{
-     socket=Socket
-    }=Stream) ->
-    case sock:send(Socket, h2_frame:to_binary(F)) of
-        ok ->
-            case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-                true ->
-                    {next_state, closed, Stream, 0};
-                _ ->
-                    {next_state, half_closed_remote, Stream}
-            end;
-        {error,_} ->
-            {next_state, closed, Stream, 0}
-    end;
+send(#{id := Id, pid := Pid}, Data) when is_binary(Data) ->
+    gen_statem:call(Pid, {stream_send, Id, Data, []}).
 
 
-half_closed_remote(cast, _,
-       #stream_state{}=Stream) ->
-    rst_stream_(?STREAM_CLOSED, Stream);
-half_closed_remote(Type, Event, State) ->
-    handle_event(Type, Event, State).
+send(#{id := Id, pid := Pid}, Data, Opts) ->
+    gen_statem:call(Pid, {stream_send, Id, Data, Opts}).
 
-%% PUSH_PROMISES can only be received by streams in the open or
-%% half_closed_local, but will create a new stream in the idle state,
-%% but that stream may be ready to transition, it'll make sense, I
-%% hope!
-half_closed_local(cast,
-  {recv_h, Headers},
-  #stream_state{}=Stream) ->
-  case is_valid_headers(response, Headers) of
-      ok ->
-          {next_state,
-           half_closed_local,
-           Stream#stream_state{
-             response_headers=Headers}};
-      {error, Code} ->
-          rst_stream_(Code, Stream)
-  end;
-half_closed_local(cast,
-  {recv_data,
-   {#frame_header{
-       flags=Flags,
-       type=?DATA
-      },_}=F},
-  #stream_state{
-     incoming_frames=IFQ
-     } = Stream) ->
-    NewQ = queue:in(F, IFQ),
-    case ?IS_FLAG(Flags, ?FLAG_END_STREAM) of
-        true ->
-            Data =
-                [h2_frame_data:data(Payload)
-                 || {#frame_header{type=?DATA}, Payload} <- queue:to_list(NewQ)],
-            {next_state, closed,
-             Stream#stream_state{
-               incoming_frames=queue:new(),
-               response_body = Data
-              }, 0};
-        _ ->
-            {next_state,
-             half_closed_local,
-             Stream#stream_state{
-               incoming_frames=NewQ
-              }}
-    end;
 
-half_closed_local(cast, recv_es,
-                  #stream_state{
-                     response_body = undefined,
-                     incoming_frames = Q
-                    } = Stream) ->
-    Data = [h2_frame_data:data(Payload) || {#frame_header{type=?DATA}, Payload} <- queue:to_list(Q)],
-    {next_state, closed,
-     Stream#stream_state{
-       incoming_frames=queue:new(),
-       response_body = Data
-      }, 0};
+recv(#{} = Stream) ->
+    recv(Stream, 5000).
 
-half_closed_local(cast, recv_es,
-                  #stream_state{
-                     response_body = Data
-                    } = Stream) ->
-    {next_state, closed,
-     Stream#stream_state{
-       incoming_frames=queue:new(),
-       response_body = Data
-      }, 0};
 
-half_closed_local(_, _,
-       #stream_state{}=Stream) ->
-    rst_stream_(?STREAM_CLOSED, Stream);
-half_closed_local(Type, Event, State) ->
-    handle_event(Type, Event, State).
-
-closed(timeout, _,
-       #stream_state{}=Stream) ->
-    gen_statem:cast(Stream#stream_state.connection,
-                    {stream_finished,
-                     Stream#stream_state.stream_id,
-                     Stream#stream_state.response_headers,
-                     Stream#stream_state.response_body}),
-    {stop, normal, Stream};
-closed(_, _,
-       #stream_state{}=Stream) ->
-    rst_stream_(?STREAM_CLOSED, Stream);
-closed(Type, Event, State) ->
-    handle_event(Type, Event, State).
-
-handle_event(_, {send_window_update, 0},
-             #stream_state{}=Stream) ->
-    {keep_state, Stream};
-handle_event(_, {send_window_update, Size},
-             #stream_state{
-               socket=Socket,
-               stream_id=StreamId
-              }=Stream) ->
-    h2_frame_window_update:send(Socket, Size, StreamId),
-    {keep_state, Stream#stream_state{}};
-handle_event(_, {send_connection_window_update, Size},
-             #stream_state{
-                  connection=ConnPid
-                 }=State) ->
-    h2_connection:send_window_update(ConnPid, Size),
-    {keep_state, State};
-handle_event({call,  From}, {rst_stream, ErrorCode}, State=#stream_state{}) ->
-    {keep_state, State, [{reply, From, {ok, rst_stream_(ErrorCode, State)}}]};
-handle_event({call, From}, stream_id, State=#stream_state{stream_id=StreamId}) ->
-    {keep_state, State, [{reply, From, StreamId}]};
-handle_event({call, From}, connection, State=#stream_state{connection=Conn}) ->
-    {keep_state, State, [{reply, From, Conn}]};
-handle_event({call, From}, Event, State=#stream_state{callback_mod=CB,
-                                                      callback_state=CallbackState}) ->
-    {ok, Reply, CallbackState1} = CB:handle_call(Event, CallbackState),
-    {keep_state, State#stream_state{callback_state=CallbackState1}, [{reply, From, Reply}]};
-handle_event(cast, Event, State=#stream_state{callback_mod=CB,
-                                              callback_state=CallbackState}) ->
-    CallbackState1 = CB:handle_info(Event, CallbackState),
-    {keep_state, State#stream_state{callback_state=CallbackState1}};
-handle_event(info, Event, State=#stream_state{callback_mod=CB,
-                                              callback_state=CallbackState}) ->
-     CallbackState1 = CB:handle_info(Event, CallbackState),
-    {keep_state, State#stream_state{callback_state=CallbackState1}};
-handle_event(_, _Event, State) ->
-     {keep_state, State}.
-
-code_change(_OldVsn, StateName, State, _Extra) ->
-    {ok, StateName, State}.
-
-terminate(normal, _StateName, _State) ->
-    ok;
-terminate(_Reason, _StateName, _State) ->
-    ok.
-
--spec rst_stream_(error_code(), state()) ->
-                         {next_state,
-                          closed,
-                          state(),
-                          timeout()}.
-rst_stream_(ErrorCode,
-           #stream_state{
-              socket=Socket,
-              stream_id=StreamId
-              }=Stream
-          )
-            ->
-    RstStream = h2_frame_rst_stream:new(ErrorCode),
-    RstStreamBin = h2_frame:to_binary(
-                  {#frame_header{
-                      stream_id=StreamId
-                     },
-                   RstStream}),
-    sock:send(Socket, RstStreamBin),
-    {next_state,
-     closed,
-     Stream, 0}.
-
-check_content_length(Stream) ->
-    ContentLength =
-        proplists:get_value(<<"content-length">>,
-                            Stream#stream_state.request_headers),
-
-    case ContentLength of
-        undefined ->
-            ok;
-        _Other ->
-            try binary_to_integer(ContentLength) of
-                Integer ->
-                    case Stream#stream_state.request_body_size =:= Integer of
-                        true ->
-                            ok;
-                        false ->
-                            rst_stream_(?PROTOCOL_ERROR, Stream),
-                            rst_stream
-                    end
-            catch
-                _:_ ->
-                    rst_stream_(?PROTOCOL_ERROR, Stream),
-                    rst_stream
-            end
+recv(#{id := Id, pid := Pid}, Timeout) ->
+    receive
+        {Id, Pid, resp, Resp} ->
+            {ok, Resp};
+        {Id, Pid, headers, Resp} ->
+            {ok, Resp};
+        {Id, Pid, data, Data} ->
+            {data, Data};
+        {Id, Pid, trailers, Trailers} ->
+            {trailers, Trailers};
+        {Id, Pid, closed} ->
+            closed;
+        {Id, Pid, error, Error} ->
+            {error, Error}
     end.
 
 
-%%% Moving header validation into streams
+new(StreamId, State) ->
+    new(StreamId, State, undefined, false, 0, 0).
 
-%% Function checks if a set of headers is valid. Currently that means:
-%%
-%% * The list of acceptable pseudoheaders for requests are:
-%%      :method, :scheme, :authority, :path,
-%% * The only acceptable pseudoheader for responses is :status
-%% * All header names are lowercase.
-%% * All pseudoheaders occur before normal headers.
-%% * No pseudoheaders are duplicated
 
--spec is_valid_headers( request | response,
-                        hpack:headers() ) ->
-                              ok | {error, term()}.
-is_valid_headers(Type, Headers) ->
-    case
-        validate_pseudos(Type, Headers)
-    of
+new(StreamId, State, ControllingPid, Async, SendWindowSize, RecvWindowSize) ->
+    Type = case StreamId rem 2 == 0 of
+        true -> server;
+        false -> client
+    end,
+    #{
+        id => StreamId,
+        state => State,
+        type => Type,
+        controlling_pid => ControllingPid,
+        async => Async,
+        send_queue => queue:new(),
+        send_window_size => SendWindowSize,
+        recv_window_size => RecvWindowSize,
+        resp => undefined,
+        error => undefined
+    }.
+
+
+handle_event(Stream, Event, Msg) ->
+    #{
+        state := State
+    } = Stream,
+
+    Handle = case State of
+        idle -> fun idle/3,
+        reserved_local -> fun reserved_local/3,
+        reserved_remote -> fun reserved_remote/3,
+        open -> fun open/3,
+        half_closed_local -> fun half_closed_local/3,
+        half_closed_remote -> fun half_closed_remote/3,
+        closed -> fun closed/3
+    end,
+
+    Handle(Stream, Event, Msg).
+
+
+
+idle(Stream, _Event, _Msg) ->
+    #{
+        stream_id := StreamId
+    } = Stream,
+    ?STREAM_ERROR(StreamId, ?PROTOCOL_ERROR).
+
+
+open(#{resp := undefined} = Stream, headers, {RawHeaders, EndStream}) ->
+    Resp1 = h2_headers:handle_resp_headers(RawHeaders),
+    Resp2 = case Async of
         true ->
-            ok;
+            send(Stream, headers, Resp1);
+            async;
+        false when EndStream ->
+            send(Stream, headers, Resp1#{body => <<>>});
         false ->
+            Resp1
+    end,
+
+    Stream#{
+        resp := Resp2
+    };
+
+open(#{resp,})
+
+
+
+reset(Stream, ErrorCode) ->
+    #{
+        stream_id := StreamId,
+        controlling_pid := ControllingPid,
+        resp := Resp
+    },
+    case is_pid(ControllingPid) and not Resp == complete of
+        true ->
+            ControllingPid ! {StreamId, self(), error, ErrorCode};
+        false ->
+            ok
+    end,
+    Stream#{
+        state := closed,
+        send_queue := queue:new(),
+        resp := complete,
+        error := ErrorCode
+    }.
+
+
+handle_headers(#{type := client, state := State} = Stream, Headers, EndStream)
+        when State == open; State == half_closed_local ->
+    #{
+        resp := Resp
+    } = Stream,
+
+    case {Resp, EndStream} of
+        {undefined, false} -> ok;
+        {#{}, true} -> ok;
+        {async, true} -> ok;
+        _ -> ?STREAM_ERROR(?PROTOCOL_ERROR)
+    end,
+
+    case EndStream of
+        true -> handle_resp_headers(Stream, Headers);
+        false -> handle_resp_trailers(Stream, Headers)
+    end;
+
+handle_headers(Stream, _Headers, _EndStream) ->
+    #{
+        stream_id := StreamId
+    } = Stream,
+    ?STREAM_ERROR(StreamId, ?STREAM_CLOSED).
+
+
+handle_resp_headers(Stream, RawHeaders) ->
+    #{
+        stream_id := StreamId,
+        controlling_pid := ControllingPid
+        async := Async,
+        resp := undefined
+    } = Stream,
+
+    {Status, Headers} = h2_headers:handle_resp_headers(RawHeaders),
+
+    Resp = #{
+        status => Status,
+        headers => Headers
+    },
+
+    NewResp = case Async of
+        true ->
+            ControllingPid ! {StreamId, self(), headers, Resp};
+            async;
+        false ->
+            Resp
+    end,
+
+    {ok, Stream#{
+        resp := NewResp
+    }}.
+
+
+handle_resp_trailers(Stream, RawHeaders) ->
+    #{
+        stream_id := StreamId,
+        state := State,
+        controlling_pid := ControllingPid
+        async := Async,
+        resp := Resp
+    } = Stream,
+
+    Trailers = h2_headers:handle_resp_trailers(RawHeaders),
+
+    NewResp = case Async of
+        true ->
+            ControllingPid ! {StreamId, self(), trailers, Trailers};
+        false ->
+            FinalResp = Resp#{trailers => Trailers},
+            ControllingPid ! {StreamId, self(), resp, FinalResp}
+    end,
+
+    NewState = case State of
+        open -> half_closed_remote;
+        half_closed_local -> closed
+    end,
+
+    {ok, Stream#{
+        state := NewState,
+        resp := complete
+    }}.
+
+handle_data(#{state := State} = Stream, Frame)
+        when State == open; State == half_closed_local ->
+    #{
+        stream_id := StreamId,
+        state := State,
+        controlling_pid := ControllingPid,
+        async := Async,
+        recv_window_size := RecvWindow,
+        resp := Resp
+    } = Stream,
+
+    #frame{
+        length = Length,
+        flags = Flags,
+        data = Data
+    } = Frame,
+
+    EndStream = ?IS_FLAG(Flags, ?END_STREAM),
+
+    NewResp = case Async of
+        true -> handle_async_data(Stream, Data, EndStream);
+        false -> handle_sync_data(Stream, Data, EndStream)
+    end,
+
+    NextState = case {State, EndStream} of
+        {open, true} ->
+            half_closed_remote;
+        {half_closed_local, true} ->
+            closed;
+        _ ->
+            State
+    end,
+
+    {ok, Stream#{
+        state := NextState,
+        recv_window_size := RecvWindow - Length,
+        resp := NewResp
+    }};
+
+handle_data(#{} = Stream, _Frame) ->
+    {error, ?STREAM_CLOSED}.
+
+
+handle_async_data(Stream, Data, EndStream) ->
+    #{
+        stream_id := StreamId,
+        controlling_pid := ControllingPid
+    } = Stream,
+    ControllingPid ! {StreamId, self(), data, Data},
+    case EndStream of
+        true ->
+            ControllingPid ! {StreamId, self(), closed},
+            complete;
+        false ->
+            async
+    end.
+
+
+handle_sync_data(Stream, Data, EndStream) ->
+    #{
+        stream_id := StreamId,
+        controlling_pid := ControllingPid,
+        resp := Resp0
+    } = Stream,
+
+    Resp1 = queue_resp(Resp0, Data),
+    case EndStream of
+        true ->
+            Resp2 = finalize_resp(Resp1),
+            ControllingPid ! {StreamId, self(), resp, Resp2},
+            complete;
+        false ->
+            Resp1
+    end.
+
+
+handle_send_window_update(#{} = Stream, Increment) ->
+    #{
+        state := State,
+        send_window_size := OldSendWindow
+    } = Stream,
+
+    case State of
+        open -> ok;
+        half_closed_local -> ok;
+        half_closed_remote -> ok;
+        closed -> ok;
+        _ -> ?CONN_ERROR(?PROTOCOL_ERROR)
+    end,
+
+    NewSendWindow = OldSendWindow + Increment,
+
+    if NewSendWindow =< 2147483647 -> ok; true ->
+        ?CONN_ERROR(?FLOW_CONTROL_ERROR)
+    end,
+
+    {ok, Stream#{
+        send_window_size = NewSendWindow
+    }}.
+
+
+queue(#{} = Stream, Data, Opts) ->
+    #{
+        state := State,
+        send_queue := Queue
+    } = Stream,
+    EndStream0 = case proplists:get_value(end_stream, Opts) of
+        true -> true;
+        _ -> false
+    end,
+    {EndStream, Trailers} = case lists:keyfind(trailers, 1, Opts) of
+        {trailers, T} when is_list(T) ->
+            {true, T};
+        false ->
+            {EndStream0, no_trailers}
+    end,
+    case State of
+        open when not EndStream ->
+            {ok, Stream#{
+                send_queue := queue_in(Data, Trailers, Queue),
+            }}
+        open when EndStream ->
+            {ok, Stream#{
+                state := half_closed_local,
+                send_queue := queue_in(Data, Trailers, Queue),
+            }};
+        half_closed_remote when not EndStream ->
+            {ok, Stream#{
+                send_queue := queue_in(Data, Trailers, Queue),
+            }};
+        half_closed_remote when EndStream ->
+            {ok, Stream#{
+                state := closed
+                send_queue := queue_in(Data, Trailers, Queue)
+            }};
+        closed ->
+            {error, ?STREAM_CLOSED};
+        _ ->
             {error, ?PROTOCOL_ERROR}
     end.
 
-no_upper_names(Headers) ->
-    lists:all(
-      fun({Name,_}) ->
-              NameStr = binary_to_list(Name),
-              NameStr =:= string:to_lower(NameStr)
-      end,
-     Headers).
 
-validate_pseudos(Type, Headers) ->
-    validate_pseudos(Type, Headers, #{}).
+queue_in(Data, Trailers, Queue0) ->
+    Queue1 = case iolist_size(Data) of
+        0 -> Queue0;
+        _ -> queue:in(Data, Queue0)
+    end,
+    case Trailers of
+        no_trailers -> Queue1;
+        Trailers -> queue:in({trailers, Trailers}, Queue1)
+    end.
 
-validate_pseudos(request, [{<<":path">>,_V}|_Tail], #{<<":path">> := true }) ->
-    false;
-validate_pseudos(request, [{<<":path">>,_V}|Tail], Found) ->
-    validate_pseudos(request, Tail, Found#{<<":path">> => true});
-validate_pseudos(request, [{<<":method">>,_V}|_Tail], #{<<":method">> := true }) ->
-    false;
-validate_pseudos(request, [{<<":method">>,_V}|Tail], Found) ->
-    validate_pseudos(request, Tail, Found#{<<":method">> => true});
-validate_pseudos(request, [{<<":scheme">>,_V}|_Tail], #{<<":scheme">> := true }) ->
-    false;
-validate_pseudos(request, [{<<":scheme">>,_V}|Tail], Found) ->
-    validate_pseudos(request, Tail, Found#{<<":scheme">> => true});
-validate_pseudos(request, [{<<":authority">>,_V}|_Tail], #{<<":authority">> := true }) ->
-    false;
-validate_pseudos(request, [{<<":authority">>,_V}|Tail], Found) ->
-    validate_pseudos(request, Tail, Found#{<<":authority">> => true});
-validate_pseudos(response, [{<<":status">>,_V}|_Tail], #{<<":status">> := true }) ->
-    false;
-validate_pseudos(response, [{<<":status">>,_V}|Tail], Found) ->
-    validate_pseudos(response, Tail, Found#{<<":status">> => true});
-validate_pseudos(_, DoneWithPseudos, _Found) ->
-    lists:all(
-      fun({<<$:, _/binary>>, _}) ->
-              false;
-         ({<<"connection">>, _}) ->
-              false;
-         ({<<"te">>, <<"trailers">>}) ->
-              true;
-         ({<<"te">>, _}) ->
-              false;
-         (_) -> true
-      end,
-      DoneWithPseudos)
-        andalso
-        no_upper_names(DoneWithPseudos).
+
+dequeue(Stream, ConnSendWindow, MaxFrameSize) ->
+    #{
+        stream_id := StreamId,
+        state := State,
+        send_queue := Queue,
+        send_window_size := StreamSendWindow,
+    } = Stream,
+
+    MaxToSend = lists:min([ConnSendWindow, StreamSendWindow, MaxFrameSize]),
+    {DataBin, NewQueue} = dequeue_data(Queue, MaxToSend),
+
+    Next = case queue:peek(NewQueue) of
+        {value, {trailers, _} = T} ->
+            T;
+        {value, _IoData} ->
+            data;
+        empty when State == closed; State == half_closed_local ->
+            end_stream;
+        empty when State == open; State == half_closed_remote ->
+            open
+        empty ->
+            ?CONN_ERROR(?PROTOCOL_ERROR)
+    end,
+
+    Flags = case Next of
+        end_stream -> ?END_STREAM;
+        _ -> 0
+    end,
+
+    Frames = case size(DataBin) > 0 of
+        true ->
+            Frame0 = h2_frame:data(Flags, StreamId, DataBin),
+            case Next of
+                {trailers, TFrames} -> [Frame0 | TFrames];
+                _ -> [Frame0]
+            end;
+        false ->
+            case Next of
+                {trailers, TFrames} -> TFrames;
+                _ -> []
+            end
+    end,
+
+    NewStream = Stream#{
+        send_queue := NewQueue,
+        send_window_size := StreamSendWindow - size(DataBin)
+    },
+    {ok, NewStream, Frames}.
+
+
+dequeue_data(Queue, MaxToSend) ->
+    dequeue_data(Queue, MaxToSend, []).
+
+
+dequeue_data(Queue, 0, Acc) ->
+    Bin = iolist_to_binary(lists:reverse(Acc)),
+    {Bin, Queue};
+
+dequeue_data(Queue, MaxToSend, Acc) when MaxToSend > 0 ->
+    case queue:peek(Queue) of
+        {value, {trailers, _}} ->
+            dequeue_data(Queue, 0, Acc);
+        {value, IoData} ->
+            {{value, IoData}, NewQueue} = queue:out(Queue),
+            Size = iolist_size(IoData),
+            case Size =< MaxToSend of
+                true ->
+                    dequeue_data(NewQueue, MaxToSend - Size, [IoData | Acc]);
+                false ->
+                    Bin = iolist_to_binary(IoData),
+                    <<ToSend:MaxToSend/binary, Rest/binary>> = Bin,
+                    Requeued = queue:in_r(Rest, NewQueue),
+                    dequeue_data(Requeued, 0, [ToSend | Acc])
+            end;
+        empty ->
+            dequeue_data(Queue, 0, Acc)
+    end.
+
+
+queue_resp(#{body := Acc} = Resp, Data) ->
+    Resp#{
+        body := [Data | Acc]
+    };
+
+queue_resp(#{} = Resp, Data) ->
+    Resp#{
+        body => [Data]
+    }.
+
+
+finalize_resp(#{body := Acc} = Resp) ->
+    Resp#{
+        body := lists:reverse(Acc)
+    };
+
+finalise_resp(#{} = Resp) ->
+    Resp#{
+        body := <<>>
+    }.
+

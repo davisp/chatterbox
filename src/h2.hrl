@@ -149,3 +149,83 @@
 
 
 -define(DEFAULT_INITIAL_WINDOW_SIZE, 65535).
+
+
+-type stream_state() ::
+    idle |
+    reserved_local |
+    reserved_remote |
+    open |
+    half_closed_local |
+    half_closed_remote |
+    closed.
+
+
+-type stream() :: #{
+    id := stream_id(),
+    pid := pid()
+}.
+
+
+-type stream_int() :: #{
+    id := stream_id(),
+    state := stream_state(),
+    type := client | server,
+    controlling_pid := pid(),
+    handler := fun(term(), term(), term()) -> term(),
+    send_queue := queue:queue(),
+    send_window_size := integer(),
+    recv_window_size := integer(),
+    resp := undefined | complete | async | response(),
+    error := undefined | error_code()
+}.
+
+
+-type stream_group() :: #{
+    streams := streams(),
+    oldest_id := non_neg_integer(),
+    next_id := non_neg_integer(),
+    active := non_neg_integer()
+}.
+
+
+-record(stream_set, {
+    type = client :: client | server,
+
+    send_settings :: settings(),
+    recv_settings :: settings(),
+
+    recv_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
+    send_window_size = ?DEFAULT_INITIAL_WINDOW_SIZE :: integer(),
+
+    local = stream_group(),
+    remote = stream_group()
+}).
+
+
+-type stream_set() :: #stream_set{}.
+
+
+-type header_opt() :: no_index | never_index | no_name_index | uncompressed.
+-type header() :: {binary(), binary()} | {binary(), binary(), [header_opt()]}.
+-type headers() [header()].
+
+
+-type stream_opt() :: async.
+-type send_opt() :: end_stream.
+
+
+-type response() :: #{
+    staus := non_neg_integer(),
+    headers := headers(),
+    body => iodata(),
+    trailers => headers()
+}.
+
+
+-define(CONN_ERROR(ErrorCode), throw({h2_goaway, ErrorCode})).
+-define(
+    STREAM_ERROR(StreamId, ErrorCode),
+    throw({h2_stream_error, StreamId, ErrorCode})
+).
+

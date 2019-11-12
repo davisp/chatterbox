@@ -15,6 +15,13 @@
 
     frame_type/0,
     frame_data/0,
-    frame/0
-]).
+    frame/0,
 
+    stream_type/0,
+    stream_state/0,
+    stream/0,
+
+    header_opt/0,
+    header/0,
+    headers/0
+]).

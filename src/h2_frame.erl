@@ -72,6 +72,14 @@ new(Type, StreamId, Flags) ->
     }.
 
 
+rst_stream(StreamId, ErrorCode) ->
+    #frame{
+        type = ?RST_STREAM,
+        stream_id = StreamId,
+        data = ErrorCode
+    }.
+
+
 settings_ack() ->
     #frame{
         type = ?SETTINGS,
