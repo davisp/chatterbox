@@ -1,20 +1,24 @@
-%% -*- mode: erlang -*-
-{application, chatterbox,
- [
-  {description, "chatterbox library for http2"},
-  {vsn, git},
-  {registered, []},
-  {applications, [
-                  kernel,
-                  stdlib,
-                  crypto,
-                  public_key,
-                  ssl,
-                  hpack
-                 ]},
-  {env, []},
-  {maintainers, ["Joe DeVivo"]},
-  {licenses, ["MIT"]},
-  {links, [{"Github", "https://github.com/joedevivo/chatterbox"}]}
- ]}.
-%% vim: set filetype=erlang tabstop=2
+%% This file is part of Chatterbox released
+%% under the MIT License.
+
+{application, chatterbox, [
+    {description, "An HTTP/2 library for Erlang"},
+    {vsn, git},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        public_key,
+        ssl,
+        hpack
+    ]},
+    {env, []},
+    {maintainers, [
+        "Joe DeVivo",
+        "Tristan Sloughter",
+        "Paul J. Davis"
+    ]},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/joedevivo/chatterbox"}]}
+]}.
